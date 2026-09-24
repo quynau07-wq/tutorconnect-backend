@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: tutorconnect-api
+    runtime: node
+    plan: free
+    rootDir: backend
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 24.16.0
+      - key: NODE_ENV
+        value: production
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_CLIENT_EMAIL
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY
+        sync: false
+      - key: ADMIN_EMAILS
+        sync: false
+      - key: SUPER_ADMIN_EMAILS
+        sync: false
+      - key: PAYMENT_PROVIDER
+        value: zalopay
+      - key: ZALOPAY_VERIFY_MODE
+        value: query
+      - key: ZALOPAY_APP_ID
+        sync: false
+      - key: ZALOPAY_KEY1
+        sync: false
