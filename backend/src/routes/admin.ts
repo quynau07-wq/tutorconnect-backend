@@ -6,6 +6,7 @@ import {getAuth} from 'firebase-admin/auth';
 import {db} from '../config/firebase.js';
 import {requireAdmin, requireSuperAdmin} from '../middleware/admin.js';
 import {tutorStatus} from './profile.js';
+import {revenueRange, summarizeRevenue} from '../domain/revenue.js';
 
 const router = Router();
 const tutors = db.collection('users');
@@ -303,15 +304,30 @@ router.delete('/staff/:uid', ...requireSuperAdmin, async (request, response) => 
 });
 
 router.get('/revenue', ...requireSuperAdmin, async (request, response) => {
-  const from = typeof request.query.from === 'string' ? new Date(request.query.from) : new Date(0);
-  const to = typeof request.query.to === 'string' ? new Date(request.query.to) : new Date();
-  const snapshot = await db.collection('payments')
-    .where('status', '==', 'paid')
-    .where('createdAt', '>=', from)
-    .where('createdAt', '<=', to)
-    .get();
-  const total = snapshot.docs.reduce((sum, item) => sum + Number(item.data().amount || 0), 0);
-  response.json({from: from.toISOString(), to: to.toISOString(), total, count: snapshot.size});
+  let range;
+  try {
+    range = revenueRange(typeof request.query.period === 'string' ? request.query.period : 'month', typeof request.query.from === 'string' ? request.query.from : undefined, typeof request.query.to === 'string' ? request.query.to : undefined);
+  } catch (error) { response.status(400).json({message: (error as Error).message}); return; }
+  // A single-field range query avoids requiring a new composite index.
+  const query = db.collection('payments').where('createdAt', '>=', new Date(range.fromMs)).where('createdAt', '<', new Date(range.toMs)).orderBy('createdAt').limit(500);
+  const payments: Record<string, any>[] = [];
+  let cursor: QueryDocumentSnapshot | undefined;
+  while (true) {
+    const page = await (cursor ? query.startAfter(cursor) : query).get();
+    payments.push(...page.docs.map(doc => doc.data()).filter(p => p.status === 'paid'));
+    if (page.size < 500) break;
+    cursor = page.docs[page.docs.length - 1];
+  }
+  const ids = [...new Set(payments.filter(p => !p.tutorId && typeof p.contractId === 'string' && p.contractId).map(p => p.contractId as string))];
+  const contracts = new Map<string, Record<string, any>>();
+  for (let i = 0; i < ids.length; i += 200) {
+    const docs = await db.getAll(...ids.slice(i, i + 200).map(id => db.collection('learning_contracts').doc(id)));
+    for (const doc of docs) contracts.set(doc.id, doc.data() || {});
+  }
+  response.json(summarizeRevenue(payments.map(p => {
+    const contract = contracts.get(p.contractId);
+    return {amount: p.amount, status: p.status, timestamp: p.createdAt?.toMillis?.() ?? NaN, tutorId: p.tutorId || contract?.tutorId, tutorName: p.tutorName || contract?.tutorName};
+  }), range));
 });
 
 export default router;

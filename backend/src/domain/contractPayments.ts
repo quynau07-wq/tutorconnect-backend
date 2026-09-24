@@ -68,6 +68,8 @@ export async function settleContractPayment(
     tx.create(paymentRef, {
       contractId: ref.id,
       userId: data.userId,
+      tutorId: data.tutorId || null,
+      tutorName: data.tutorName || null,
       stage: order.stage,
       amount,
       provider: order.provider,
