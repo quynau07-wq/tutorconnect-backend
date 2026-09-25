@@ -12,6 +12,7 @@ function collection(name) {
     return ref;
   }, where: (field, op, value) => ({get: async () => ({docs: [...records.entries()].filter(([key, data]) => key.startsWith(`${name}/`) && (op === '==' ? data[field] === value : value.includes(data[field]))).map(([key]) => snapshot(base.doc(key.split('/')[1])))})}),
   get: async () => ({docs: [...records.keys()].filter(key => key.startsWith(`${name}/`)).map(key => snapshot(base.doc(key.split('/')[1])))})};
+  base.add = async data => {const ref = base.doc(); await ref.set(data); return ref;};
   return base;
 }
 const db = {collection, runTransaction: async action => {
@@ -62,6 +63,61 @@ beforeEach(() => {
   records.set('tutor_verifications/tutor', {front: 'private front', back: 'private back', portrait: 'private portrait'});
   records.set('job_posts/job', {userId: 'owner', status: 'OPEN', subject: 'Toán'});
 });
+test('personal editor restores tutor details without exposing verification or overwriting account identity', async () => {
+  records.set('tutor_profiles/tutor', {...emptyTutorDraft(), dateOfBirth: '1995-03-12', gender: 'Nam', province: 'Hà Nội', ward: 'Phường A', photoURL: 'data:image/jpeg;base64,avatar', bio: 'Teaching bio'});
+  const result = await call('tutor', '/profile/personal');
+  assert.equal(result.status, 200);
+  assert.equal(result.body.dateOfBirth, '1995-03-12');
+  assert.equal(result.body.province, 'Hà Nội');
+  assert.equal(result.body.displayName, 'Tutor');
+  assert.equal(result.body.bio, undefined);
+  assert.equal(result.body.front, undefined);
+});
+
+test('personal edits stay in sync with tutor onboarding and preserve teaching fields', async () => {
+  records.set('tutor_profiles/tutor', {...emptyTutorDraft(), bio: 'Keep biography', subjects: ['Toán']});
+  const data = {displayName: 'Updated tutor', phoneNumber: '0912345678', photoURL: 'data:image/jpeg;base64,new', dateOfBirth: '1995-03-12', gender: 'Nữ', province: 'Hà Nội', ward: 'Phường A', district: '', address: '10 phố A', coordinates: null};
+  assert.equal((await call('tutor', '/profile/personal', 'PUT', data)).status, 200);
+  const personal = await call('tutor', '/profile/personal');
+  const teaching = await call('tutor', '/profile/tutor');
+  assert.equal(personal.body.displayName, data.displayName);
+  assert.equal(teaching.body.account.displayName, data.displayName);
+  assert.equal(teaching.body.draft.dateOfBirth, data.dateOfBirth);
+  assert.equal(teaching.body.draft.photoURL, data.photoURL);
+  assert.equal(teaching.body.draft.bio, 'Keep biography');
+  assert.deepEqual(teaching.body.draft.subjects, ['Toán']);
+});
+
+test('saving a tutor draft restores the same personal fields when reopening either editor', async () => {
+  const draft = {...emptyTutorDraft(), dateOfBirth: '1997-04-15', gender: 'Nam', province: 'Hà Nội', photoURL: 'data:image/jpeg;base64,new'};
+  assert.equal((await call('tutor', '/profile/tutor', 'PUT', {draft})).status, 200);
+  assert.equal((await call('tutor', '/profile/personal')).body.dateOfBirth, draft.dateOfBirth);
+  assert.equal((await call('tutor', '/profile/tutor')).body.draft.photoURL, draft.photoURL);
+  assert.equal(records.get('users/tutor').photoURL, draft.photoURL);
+});
+
+test('legacy shared fields prefer the latest profile and preserve intentionally cleared values', async () => {
+  records.set('tutor_profiles/tutor', {...emptyTutorDraft(), address: 'Old address', coordinates: {latitude: 21, longitude: 105}, updatedAt: {seconds: 10}});
+  records.set('user_profiles/tutor', {address: '', coordinates: null, gender: 'Nữ', updatedAt: {seconds: 20}});
+  assert.equal((await call('tutor', '/profile/personal')).body.address, '');
+  const result = await call('tutor', '/profile/tutor');
+  assert.equal(result.body.draft.address, '');
+  assert.equal(result.body.draft.coordinates, null);
+  assert.equal(result.body.draft.gender, 'Nữ');
+});
+
+test('job package is validated and its label is derived on the server', async () => {
+  records.set('learners/learner', {userId: 'owner', grade: 'Lớp 8'});
+  const data = {learnerId: 'learner', subject: 'Toán', grade: 'Lớp 8', goal: '', learningMode: 'ONLINE', location: '', sessionsPerWeek: '2', durationMinutes: '120', budget: '200000', requirements: '', description: '', scheduleFlexibility: 'FIXED', schedule: [{dayOfWeek: 'MONDAY', startTime: '18:00', endTime: '20:00'}], packageId: 'MONTH_3', packageLabel: 'Forged label'};
+  assert.equal((await call('owner', '/learning/jobs', 'POST', {...data, packageId: 'INVALID'})).status, 400);
+  const result = await call('owner', '/learning/jobs', 'POST', data);
+  assert.equal(result.status, 201, JSON.stringify(result.body));
+  assert.equal(result.body.packageId, 'MONTH_3');
+  assert.equal(result.body.packageLabel, '3 tháng');
+  assert.equal(records.get(`job_posts/${result.body.id}`).packageId, 'MONTH_3');
+  assert.equal((await call('tutor', `/learning/jobs/${result.body.id}`)).body.packageLabel, '3 tháng');
+});
+
 test('monthly leaderboard returns at most three approved tutors with public fields only', async () => {
   const updatedAt = {toMillis: () => Date.now() - 1};
   for (let i = 0; i < 5; i++) {
@@ -338,6 +394,40 @@ test('dispute needs admin resolution with a reason, and can reopen for makeup', 
   assert.equal(records.get('learning_contracts/c1').lessonRecords[0].attendance.status,'REOPENED');
   assert.equal(records.get('learning_contracts/c1').status,'FIRST_SCHEDULED');
 });
+test('reopened makeup cannot be reported or completed until a new schedule is accepted', async () => {
+  seedContract('FIRST_SCHEDULED', 1);
+  const path = '/operations/class/c1/lesson/0/';
+  await call('tutor', path + 'report', 'POST');
+  await call('owner', path + 'dispute', 'POST', {reason: 'Did not attend'});
+  await call('admin', '/operations/admin/c1/0/resolve', 'POST', {decision: 'REOPEN', note: 'Arrange makeup'});
+  assert.equal((await call('tutor', path + 'report', 'POST')).status, 400);
+  assert.equal((await call('admin', '/contracts/admin/c1/complete-first', 'POST')).status, 400);
+  assert.equal((await call('owner', path + 'change', 'POST', {date: '2090-02-01', startTime: '18:00', endTime: '20:00', reason: 'Makeup'})).status, 200);
+  const changeId = records.get('learning_contracts/c1').lessonRecords[0].change.id;
+  assert.equal((await call('tutor', path + 'change-response', 'POST', {changeId, decision: 'ACCEPT'})).status, 200);
+  const c = records.get('learning_contracts/c1');
+  assert.equal(c.lessonRecords[0].attendance.status, 'MAKEUP_SCHEDULED');
+  assert.equal(c.lessonRecords[0].attendanceHistory[0].resolution, 'Arrange makeup');
+  assert.equal((await call('tutor', path + 'report', 'POST')).status, 400);
+  // Simulate the accepted makeup's end time having passed.
+  c.lessons[0].date = '2020-01-01';
+  assert.equal((await call('tutor', path + 'report', 'POST')).status, 200);
+  assert.equal((await call('owner', path + 'confirm', 'POST')).status, 200);
+  assert.equal(records.get('learning_contracts/c1').status, 'COMPLETED');
+});
+
+test('a pending change can be rejected while the original lesson is in progress', async t => {
+  const c = seedContract('ACTIVE', 2);
+  records.set('learning_contracts/c1', {...c, lessons: [c.lessons[0], {date: '2090-01-01', startTime: '18:00', endTime: '20:00'}]});
+  const path = '/operations/class/c1/lesson/1/';
+  await call('owner', path + 'change', 'POST', {date: '2090-01-02', startTime: '18:00', endTime: '20:00', reason: 'Busy'});
+  const changeId = records.get('learning_contracts/c1').lessonRecords[1].change.id;
+  t.mock.timers.enable({apis: ['Date'], now: new Date('2090-01-01T12:00:00Z')});
+  assert.equal((await call('tutor', path + 'change-response', 'POST', {changeId, decision: 'REJECT'})).status, 200);
+  assert.equal(records.get('learning_contracts/c1').lessonRecords[1].change.status, 'REJECTED');
+  assert.equal(records.get('learning_contracts/c1').lessons[1].date, '2090-01-01');
+});
+
 test('journals and homework have distinct permissions and appear only to participants', async () => {
   seedContract('ACTIVE');
   const body={content:'Fractions',feedback:'Improving',homework:'Exercises 1-5',nextGoal:'Decimals'};

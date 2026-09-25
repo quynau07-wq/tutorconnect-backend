@@ -35,6 +35,8 @@ export function completionPatch(
   index: number,
   adminId: string,
 ): Record<string, any> {
+  if (data.lessonRecords?.[index]?.attendance?.status === 'REOPENED')
+    throw new Error('Buổi được mở lại cần thống nhất lịch học bù trước khi xác nhận hoàn thành.');
   if (data.lessonRecords?.[index]?.change?.status === 'PENDING')
     throw new Error('Cần xử lý đề nghị đổi lịch trước.');
   const lessons = contractLessons('', data);

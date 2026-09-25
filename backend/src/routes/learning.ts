@@ -8,6 +8,7 @@ import {account, tutorStatus} from './profile.js';
 import {matchSchedule, validateSchedule} from '../domain/schedule.js';
 import {validDate} from '../domain/profiles.js';
 import {rankMonthlyTutors, vietnamMonth} from '../domain/tutorRanking.js';
+import {PACKAGES} from '../domain/packages.js';
 
 export const learningRouter = Router();
 learningRouter.use(requireAuth);
@@ -56,6 +57,8 @@ learningRouter.delete('/learners/:id', async (req, res) => {
 learningRouter.post('/jobs', async (req, res) => {
   const uid = req.firebaseUser!.uid; await account(uid, 'user');
   const body = req.body || {};
+  const selectedPackage = PACKAGES.find(item => item.id === body.packageId);
+  if (body.packageId !== undefined && !selectedPackage) throw new Error('Gói học mong muốn không hợp lệ.');
   const scheduleError = validateSchedule(body.schedule);
   if (scheduleError) throw new Error(scheduleError);
   if (!['FIXED', 'PLUS_MINUS_30', 'PLUS_MINUS_60', 'NEGOTIABLE'].includes(body.scheduleFlexibility)) throw new Error('Mức linh hoạt không hợp lệ.');
@@ -64,6 +67,7 @@ learningRouter.post('/jobs', async (req, res) => {
   if ((await db.collection('learners').doc(learnerId).get()).data()?.userId !== uid) throw new Error('Vui lòng chọn người học của bạn.');
   const data = {
     userId: uid, learnerId, subject: text(body.subject, true), grade: text(body.grade, true), goal: text(body.goal),
+    ...(selectedPackage && {packageId: selectedPackage.id, packageLabel: selectedPackage.label}),
     learningMode: body.learningMode, location: text(body.location, body.learningMode === 'OFFLINE'),
     sessionsPerWeek: number(body.sessionsPerWeek, 1, 21), durationMinutes: number(body.durationMinutes, 15, 480),
     budget: number(body.budget), requirements: text(body.requirements), description: text(body.description),

@@ -141,6 +141,8 @@ operationsRouter.post('/class/:id/lesson/:index/:action', async (req, res) => {
       if (record.attendance?.status === 'REPORTED') return;
       if (record.attendance?.status === 'DISPUTED')
         throw new Error('Buổi học đang chờ trung tâm giải quyết.');
+      if (record.attendance?.status === 'REOPENED')
+        throw new Error('Cần thống nhất lịch học bù và dạy xong buổi mới trước khi báo hoàn thành.');
       record.attendance = { status: 'REPORTED', reportedAtMs: Date.now() };
       title = 'Gia sư báo đã dạy: vui lòng xác nhận buổi học';
     } else if (action === 'confirm' || action === 'dispute') {
@@ -221,9 +223,9 @@ operationsRouter.post('/class/:id/lesson/:index/:action', async (req, res) => {
         throw new Error(
           'Đề nghị không hợp lệ hoặc không thuộc lượt phản hồi của bạn.',
         );
-      if (!['UPCOMING', 'AWAIT_CONFIRMATION'].includes(lesson.status))
-        throw new Error('Trạng thái buổi học đã thay đổi.');
       if (req.body.decision === 'ACCEPT') {
+        if (!['UPCOMING', 'AWAIT_CONFIRMATION'].includes(lesson.status))
+          throw new Error('Trạng thái buổi học đã thay đổi.');
         if (
           Date.parse(`${change.date}T${change.startTime}:00+07:00`) <=
           Date.now()
@@ -269,6 +271,14 @@ operationsRouter.post('/class/:id/lesson/:index/:action', async (req, res) => {
           throw new Error('Buổi đầu phải trước các buổi còn lại.');
         lock = await checkBooking(tx, { ...data, lessons }, id);
         patch.lessons = lessons;
+        if (record.attendance?.status === 'REOPENED') {
+          record.attendanceHistory = [...(record.attendanceHistory || []), {...record.attendance}];
+          record.attendance = {
+            status: 'MAKEUP_SCHEDULED',
+            resolution: record.attendance.resolution,
+            scheduledAtMs: Date.now(),
+          };
+        }
       }
       record.change = {
         ...change,

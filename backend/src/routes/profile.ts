@@ -4,6 +4,7 @@ import {db} from '../config/firebase.js';
 import {requireAuth} from '../middleware/auth.js';
 import {emptyTutorDraft, validateTutor, validDate, type TutorDraft, type Verification} from '../domain/profiles.js';
 import {validateSchedule} from '../domain/schedule.js';
+import {personalFields, resolvePersonalProfile} from '../domain/personalProfile.js';
 
 export const profileRouter = Router();
 profileRouter.use(requireAuth);
@@ -55,10 +56,10 @@ const safeDraft = (input: Record<string, any>): TutorDraft => {
 profileRouter.get('/tutor', async (req, res) => {
   const uid = req.firebaseUser!.uid;
   const user = await account(uid, 'tutor');
-  const [profile, verification] = await Promise.all([db.collection('tutor_profiles').doc(uid).get(), db.collection('tutor_verifications').doc(uid).get()]);
+  const [profile, verification, personal] = await Promise.all([db.collection('tutor_profiles').doc(uid).get(), db.collection('tutor_verifications').doc(uid).get(), db.collection('user_profiles').doc(uid).get()]);
   const defaults = emptyTutorDraft();
   const legacy = Object.fromEntries(Object.keys(defaults).filter(key => user[key] !== undefined && user[key] !== null).map(key => [key, user[key]]));
-  const draft = {...defaults, ...legacy, ...profile.data()};
+  const draft = {...defaults, ...legacy, ...profile.data(), ...personalFields(resolvePersonalProfile(user, personal.data(), profile.data()))};
   const aliases: Record<string, string> = {Văn: 'Ngữ văn', 'Anh văn': 'Tiếng Anh', Anh: 'Tiếng Anh', Lý: 'Vật lý', Hóa: 'Hóa học', Sinh: 'Sinh học', Sử: 'Lịch sử', Địa: 'Địa lý'};
   draft.subjects = [...new Set(draft.subjects.map((subject: string) => aliases[subject] || subject))];
   res.json({account: user, status: tutorStatus(user), rejectionReason: user.rejectionReason || '', draft, verification: verification.data() || {front: '', back: '', portrait: ''}});
@@ -76,10 +77,13 @@ profileRouter.put('/tutor', async (req, res) => {
     const ref = db.collection('users').doc(uid);
     const user = (await tx.get(ref)).data();
     if (!user || user.role !== 'tutor' || user.accountStatus === 'locked' || !['DRAFT', 'REJECTED', 'APPROVED'].includes(tutorStatus(user))) throw new Error('Hồ sơ đang xét duyệt hoặc tài khoản không được phép sửa.');
+    const personalRef = db.collection('user_profiles').doc(uid);
+    const personal = (await tx.get(personalRef)).data();
     tx.set(db.collection('tutor_profiles').doc(uid), {...draft, updatedAt: FieldValue.serverTimestamp()});
+    tx.set(personalRef, {...personal, ...personalFields(draft), coordinates: draft.coordinates, updatedAt: FieldValue.serverTimestamp()});
     tx.set(db.collection('tutor_verifications').doc(uid), {...verification, updatedAt: FieldValue.serverTimestamp()});
     // Editing an approved profile requires a fresh review; never publish unreviewed changes.
-    tx.update(ref, {tutorStatus: submit ? 'PENDING' : 'DRAFT', approvalStatus: submit ? 'pending' : 'draft', accountStatus: submit ? 'pending' : 'active', identityVerified: false, educationVerified: false, updatedAt: FieldValue.serverTimestamp()});
+    tx.update(ref, {photoURL: draft.photoURL, tutorStatus: submit ? 'PENDING' : 'DRAFT', approvalStatus: submit ? 'pending' : 'draft', accountStatus: submit ? 'pending' : 'active', identityVerified: false, educationVerified: false, updatedAt: FieldValue.serverTimestamp()});
   });
   res.json({status: submit ? 'PENDING' : 'DRAFT'});
 });
@@ -87,7 +91,9 @@ profileRouter.put('/tutor', async (req, res) => {
 profileRouter.get('/personal', async (req, res) => {
   const uid = req.firebaseUser!.uid;
   const user = await account(uid);
-  res.json({...user, ...(await db.collection('user_profiles').doc(uid).get()).data()});
+  const personal = (await db.collection('user_profiles').doc(uid).get()).data();
+  const tutor = user.role === 'tutor' ? (await db.collection('tutor_profiles').doc(uid).get()).data() : undefined;
+  res.json(resolvePersonalProfile(user, personal, tutor));
 });
 profileRouter.put('/personal', async (req, res) => {
   const uid = req.firebaseUser!.uid;
@@ -101,9 +107,15 @@ profileRouter.put('/personal', async (req, res) => {
   const coordinates = req.body.coordinates ?? null;
   if (coordinates && (!Number.isFinite(coordinates.latitude) || !Number.isFinite(coordinates.longitude) || Math.abs(coordinates.latitude) > 90 || Math.abs(coordinates.longitude) > 180)) throw new Error('Tọa độ không hợp lệ.');
   if (Buffer.byteLength(JSON.stringify(data)) > 850000) throw new Error('Ảnh quá lớn.');
-  const batch = db.batch();
-  batch.set(db.collection('user_profiles').doc(uid), {...data, coordinates, updatedAt: FieldValue.serverTimestamp()});
-  batch.update(db.collection('users').doc(uid), {displayName: data.displayName, phoneNumber: data.phoneNumber, photoURL: data.photoURL, updatedAt: FieldValue.serverTimestamp()});
-  await batch.commit();
+  await db.runTransaction(async tx => {
+    const userRef = db.collection('users').doc(uid);
+    const user = (await tx.get(userRef)).data();
+    if (!user || user.accountStatus === 'locked' || user.disabled) throw new Error('Tài khoản không hoạt động.');
+    const tutorRef = db.collection('tutor_profiles').doc(uid);
+    const tutor = user.role === 'tutor' ? await tx.get(tutorRef) : null;
+    tx.set(db.collection('user_profiles').doc(uid), {...data, coordinates, updatedAt: FieldValue.serverTimestamp()});
+    tx.update(userRef, {displayName: data.displayName, phoneNumber: data.phoneNumber, photoURL: data.photoURL, updatedAt: FieldValue.serverTimestamp()});
+    if (tutor?.exists) tx.update(tutorRef, {...personalFields(data), coordinates, updatedAt: FieldValue.serverTimestamp()});
+  });
   res.json({ok: true});
 });
