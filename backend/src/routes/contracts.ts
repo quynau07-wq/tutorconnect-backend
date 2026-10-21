@@ -1,7 +1,7 @@
 import {completeLesson} from '../domain/completeLesson.js';
 import { Router } from 'express';
 import { createHash } from 'node:crypto';
-import { FieldValue } from 'firebase-admin/firestore';
+import { FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { db } from '../config/firebase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireAdmin } from '../middleware/admin.js';
@@ -48,9 +48,19 @@ contractsRouter.get('/', async (req, res) => {
     .collection('learning_contracts')
     .where(user.role === 'tutor' ? 'tutorId' : 'userId', '==', uid)
     .get();
-  const contracts = docs.docs.map(d =>
-    present(d.id, d.data(), user.role === 'tutor'),
-  );
+  const contracts = await Promise.all(docs.docs.map(async d => {
+    const data = d.data();
+    const last = (data.lessons || []).reduce((latest: any, lesson: any) =>
+      !latest || `${lesson.date} ${lesson.endTime}` > `${latest.date} ${latest.endTime}`
+        ? lesson
+        : latest,
+    undefined);
+    if (last?.date && last?.endTime) {
+      const expiry = Timestamp.fromDate(new Date(`${last.date}T${last.endTime}:00+07:00`));
+      if (data.chatEndsAt?.toMillis?.() !== expiry.toMillis()) await d.ref.update({chatEndsAt: expiry});
+    }
+    return present(d.id, data, user.role === 'tutor');
+  }));
   res.json({
     contracts,
     rejectionCount: contracts.filter((c: any) => c.status === 'CANCELLED')
@@ -136,6 +146,7 @@ contractsRouter.post('/', async (req, res) => {
     releaseLock();
     tx.create(ref, {
       ...quote,
+      chatEndsAt: Timestamp.fromDate(new Date(`${lessons[lessons.length - 1].date}T${lessons[lessons.length - 1].endTime}:00+07:00`)),
       userId: uid,
       tutorId: body.tutorId,
       tutorName: user.displayName || '',
